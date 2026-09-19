@@ -508,6 +508,7 @@ export function useChat(
 
   // Pagination
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const paginationInFlightRef = useRef(new Map<string, Promise<void>>());
 
   // Agent name resolution map
   const { agentsMap } = useAgentsMapCache(projectId);
@@ -516,7 +517,7 @@ export function useChat(
   const streamRef = useRef<{ close: () => void } | null>(null);
   const lastAttachedGenerationRef = useRef<{ sessionId: string; replayFromEventId: number | null } | null>(null);
   const cancelledByUserRef = useRef(false);
-  const cancellationInProgressRef = useRef<Promise<void> | null>(null);
+  const cancellationsInProgressRef = useRef<Map<string, Promise<void>>>(new Map());
   const streamingTextRef = useRef("");
   const streamingThinkingRef = useRef("");
   const streamingToolCallsRef = useRef<ToolCallInfo[]>([]);
@@ -735,7 +736,7 @@ export function useChat(
 
   // Load messages when active session changes
   const loadMessages = useCallback(
-    async (sessionId: string, opts?: { offset?: number; before?: string; commitForStreamingAttach?: boolean }) => {
+    async (sessionId: string, opts?: { offset?: number; before?: string; beforeId?: string; commitForStreamingAttach?: boolean }) => {
       const isPaginationRequest = (typeof opts?.offset === "number" && opts.offset > 0) || typeof opts?.before === "string";
       const cacheKey = getChatMessagesCacheKey(projectId, sessionId);
       const cachedMessages = !isPaginationRequest ? readCachedMessages(projectId, sessionId) : [];
@@ -765,8 +766,12 @@ export function useChat(
           || (opts?.commitForStreamingAttach === true && lastAttachedGenerationRef.current?.sessionId === sessionId);
         if (isPaginationRequest) {
           if (shouldCommitMessages) {
-            setMessages((prev) => sortChatMessagesChronologically([...mappedMessages, ...prev]));
-            setHasMoreMessages(data.messages.length >= 50);
+            setMessages((prev) => {
+              const byId = new Map(prev.map((message) => [message.id, message]));
+              for (const message of mappedMessages) byId.set(message.id, message);
+              return sortChatMessagesChronologically([...byId.values()]);
+            });
+            setHasMoreMessages(data.messages.length >= 50 && mappedMessages.some((message) => !messagesRef.current.some((current) => current.id === message.id)));
           }
         } else {
           if (shouldCommitMessages) {
@@ -819,13 +824,13 @@ export function useChat(
     [getChatMessagesCacheKey, projectId, readCachedMessages],
   );
 
-  const resetTransientComposerState = useCallback(() => {
+  const resetTransientComposerState = useCallback((hasCancellationBarrier = false) => {
     cancelStreamingFlushesRef.current?.();
     cancelStreamingFlushesRef.current = null;
     pendingMessagesRef.current = [];
     setPendingMessages([]);
-    pendingQueueActionRef.current = false;
-    setPendingQueueAction(false);
+    pendingQueueActionRef.current = hasCancellationBarrier;
+    setPendingQueueAction(hasCancellationBarrier);
     streamingTextRef.current = "";
     streamingThinkingRef.current = "";
     streamingToolCallsRef.current = [];
@@ -877,13 +882,17 @@ export function useChat(
   }, [replacePendingMessages]);
 
   const flushPendingMessage = useCallback(() => {
+    const sessionId = activeSessionRef.current?.id;
+    if (!sessionId || cancellationsInProgressRef.current.has(sessionId)) {
+      return;
+    }
+
     const [queuedMessage, ...remainingMessages] = pendingMessagesRef.current;
     const trimmedQueuedMessage = queuedMessage?.trim();
     if (!trimmedQueuedMessage) {
       return;
     }
 
-    const sessionId = activeSessionRef.current?.id;
     pendingMessagesRef.current = remainingMessages;
     setPendingMessages(remainingMessages);
     setPersistedPendingChatMessages(sessionId, remainingMessages);
@@ -1161,7 +1170,7 @@ export function useChat(
           });
       }
 
-      resetTransientComposerState();
+      resetTransientComposerState(Boolean(id && cancellationsInProgressRef.current.has(id)));
       setHasMoreMessages(false);
 
       // Load messages for this session while the authoritative request is pending.
@@ -1532,28 +1541,63 @@ export function useChat(
     [projectId],
   );
 
-  // Load more messages (pagination — use before cursor for oldest displayed message)
-  // messagesRef is assigned on every render; reading from the ref here avoids
-  // closing over `messages` and prevents this callback from being recreated on
-  // every streamed token (which would cause the IntersectionObserver to churn).
+  /*
+  FNXC:ChatMessagePagination 2026-09-06-13:40:
+  Direct Chat serializes one strict tuple page per session. A response may prepend only while its session and oldest-row cursor are still current; stable-ID merging protects defensive overlap, and a duplicate-only page stops rather than spinning without progress.
+  */
   const loadMoreMessages = useCallback(async () => {
     if (!activeSession || !hasMoreMessages) return;
-    // messagesRef.current[0] is the oldest visible message; fetch older ones using its createdAt
-    const cursor = messagesRef.current[0]?.createdAt;
-    if (!cursor) return;
-    await loadMessages(activeSession.id, { before: cursor });
-  }, [activeSession, hasMoreMessages, loadMessages]);
+    const sessionId = activeSession.id;
+    const existing = paginationInFlightRef.current.get(sessionId);
+    if (existing) return existing;
+    const cursor = messagesRef.current[0];
+    if (!cursor?.createdAt || !cursor.id) return;
+
+    const request = (async () => {
+      setMessagesLoading(true);
+      try {
+        const data = await fetchChatMessages(sessionId, {
+          limit: 50,
+          order: "desc",
+          before: cursor.createdAt,
+          beforeId: cursor.id,
+        }, projectId);
+        if (activeSessionRef.current?.id !== sessionId || messagesRef.current[0]?.id !== cursor.id) return;
+        const mapped = sortChatMessagesChronologically(data.messages.map(mapChatMessageToInfo));
+        const existingIds = new Set(messagesRef.current.map((message) => message.id));
+        const added = mapped.filter((message) => !existingIds.has(message.id));
+        if (added.length > 0) {
+          setMessages((current) => {
+            const byId = new Map(current.map((message) => [message.id, message]));
+            for (const message of mapped) byId.set(message.id, message);
+            return sortChatMessagesChronologically([...byId.values()]);
+          });
+        }
+        setHasMoreMessages(data.messages.length >= 50 && added.length > 0);
+      } catch {
+        // Keep the current page and cursor retryable after a transient read failure.
+      } finally {
+        if (activeSessionRef.current?.id === sessionId) setMessagesLoading(false);
+      }
+    })();
+    paginationInFlightRef.current.set(sessionId, request);
+    try {
+      await request;
+    } finally {
+      if (paginationInFlightRef.current.get(sessionId) === request) paginationInFlightRef.current.delete(sessionId);
+    }
+  }, [activeSession, hasMoreMessages, projectId]);
 
   /*
-  FNXC:ChatPendingQueue 2026-08-19-05:47:
-  Direct Stop and selected Force share one durable cancellation/history barrier. The queue is not
-  released until that barrier succeeds, so a closed transport or failed reconciliation cannot lose
-  a pending turn or let a stale callback dispatch it into a different session incarnation.
+  FNXC:ChatPendingQueue 2026-09-06-01:36:
+  Direct Stop and selected Force share one durable cancellation/history barrier per conversation. The queue is not released until its own barrier succeeds, so concurrent cancellations in A and B cannot overwrite or release each other; re-entering either conversation restores its barrier controls and drains its text exactly once after reconciliation.
+  The dispatch threshold owns ordering while the keyboard remains local: text submitted during streaming or cancellation is queued, every flush remains fenced until the session's promise is removed, and that removal must precede onReconciled. A selected Force intent belongs to its session and exact queued slot rather than one selection incarnation, so A → B → A re-entry preserves its priority without letting a stale callback remove changed queue content. The persisted queue is text-only, so attachment-bearing submissions fail instead of silently dropping files.
   */
   const cancelAndReconcile = useCallback((onReconciled: () => void): Promise<void> | undefined => {
     const session = activeSessionRef.current;
     if (!session) return undefined;
-    if (cancellationInProgressRef.current) return cancellationInProgressRef.current;
+    const existingCancellation = cancellationsInProgressRef.current.get(session.id);
+    if (existingCancellation) return existingCancellation;
 
     pendingQueueActionRef.current = true;
     setPendingQueueAction(true);
@@ -1606,10 +1650,6 @@ export function useChat(
         } catch {
           // The queue remains durable unless the cancel response itself proves the interrupted row.
         }
-        if (activeSessionRef.current?.id !== session.id || activeSessionSelectionRef.current !== sessionSelectionVersion) {
-          return;
-        }
-
         const persistedInterruptedMessage = cancellationResult.message
           ? mapChatMessageToInfo(cancellationResult.message)
           : undefined;
@@ -1617,43 +1657,55 @@ export function useChat(
           throw new Error("Chat history reconciliation did not complete");
         }
 
-        const reconciled = [
-          ...(refreshedMessages ?? []),
-          ...(persistedInterruptedMessage && !(refreshedMessages ?? []).some((message) => message.id === persistedInterruptedMessage.id)
-            ? [persistedInterruptedMessage]
-            : []),
-        ];
-        const hasDurableInterruptedMessage = Boolean(persistedInterruptedMessage)
-          || reconciled.some((message) =>
-            message.role === "assistant"
-            && message.content === stoppedText
-            && message.metadata?.interrupted === true,
-          );
-        setMessages((current) => {
-          let next = current.filter((message) =>
-            message.id !== "streaming-assistant"
-            && (!hasDurableInterruptedMessage || message.id !== interruptedLocalId),
-          );
-          for (const persisted of reconciled) {
-            next = reconcileOptimisticSentMessage(next, persisted);
+        if (activeSessionRef.current?.id === session.id && activeSessionSelectionRef.current === sessionSelectionVersion) {
+          const reconciled = [
+            ...(refreshedMessages ?? []),
+            ...(persistedInterruptedMessage && !(refreshedMessages ?? []).some((message) => message.id === persistedInterruptedMessage.id)
+              ? [persistedInterruptedMessage]
+              : []),
+          ];
+          const hasDurableInterruptedMessage = Boolean(persistedInterruptedMessage)
+            || reconciled.some((message) =>
+              message.role === "assistant"
+              && message.content === stoppedText
+              && message.metadata?.interrupted === true,
+            );
+          setMessages((current) => {
+            let next = current.filter((message) =>
+              message.id !== "streaming-assistant"
+              && (!hasDurableInterruptedMessage || message.id !== interruptedLocalId),
+            );
+            for (const persisted of reconciled) {
+              next = reconcileOptimisticSentMessage(next, persisted);
+            }
+            return sortChatMessagesChronologically(next);
+          });
+        }
+
+        if (cancellationsInProgressRef.current.get(session.id) === cancellation) {
+          cancellationsInProgressRef.current.delete(session.id);
+          if (activeSessionRef.current?.id === session.id) {
+            pendingQueueActionRef.current = false;
+            setPendingQueueAction(false);
+            onReconciled();
           }
-          return sortChatMessagesChronologically(next);
-        });
-        onReconciled();
+        }
       })
       .catch(() => {
-        if (activeSessionRef.current?.id === session.id && activeSessionSelectionRef.current === sessionSelectionVersion) {
+        if (activeSessionRef.current?.id === session.id) {
           addToast?.("Failed to save the interrupted response; it remains visible for recovery.", "error");
         }
       })
       .finally(() => {
-        pendingQueueActionRef.current = false;
-        setPendingQueueAction(false);
-        if (cancellationInProgressRef.current === cancellation) {
-          cancellationInProgressRef.current = null;
+        if (cancellationsInProgressRef.current.get(session.id) === cancellation) {
+          cancellationsInProgressRef.current.delete(session.id);
+          if (activeSessionRef.current?.id === session.id) {
+            pendingQueueActionRef.current = false;
+            setPendingQueueAction(false);
+          }
         }
       });
-    cancellationInProgressRef.current = cancellation;
+    cancellationsInProgressRef.current.set(session.id, cancellation);
     return cancellation;
   }, [addToast, projectId]);
 
@@ -1725,7 +1777,12 @@ export function useChat(
         return;
       }
 
-      if (isStreamingRef.current) {
+      const activeSessionCancellation = cancellationsInProgressRef.current.has(activeSession.id);
+      if (isStreamingRef.current || activeSessionCancellation) {
+        if (attachments && attachments.length > 0) {
+          callbacks?.onFailed?.();
+          return;
+        }
         const trimmedContent = content.trim();
         if (!trimmedContent) {
           return;
@@ -1967,10 +2024,9 @@ export function useChat(
 
   sendMessageRef.current = sendMessage;
 
-  const dispatchPendingMessage = useCallback((sessionId: string, selectionVersion: number, index: number, content: string) => {
+  const dispatchPendingMessage = useCallback((sessionId: string, index: number, content: string) => {
     if (
       activeSessionRef.current?.id !== sessionId
-      || activeSessionSelectionRef.current !== selectionVersion
       || pendingMessagesRef.current[index]?.trim() !== content
     ) {
       return;
@@ -1982,15 +2038,14 @@ export function useChat(
     );
     sendMessageRef.current(content, undefined, {
       onFailed: () => {
-        const isCurrentSelection = activeSessionRef.current?.id === sessionId
-          && activeSessionSelectionRef.current === selectionVersion;
-        const current = isCurrentSelection
+        const isCurrentSession = activeSessionRef.current?.id === sessionId;
+        const current = isCurrentSession
           ? pendingMessagesRef.current
           : getPersistedPendingChatMessages(sessionId);
         const insertionIndex = Math.min(Math.max(index, 0), current.length);
         const restored = [...current.slice(0, insertionIndex), content, ...current.slice(insertionIndex)];
         setPersistedPendingChatMessages(sessionId, restored);
-        if (isCurrentSelection) {
+        if (isCurrentSession) {
           pendingMessagesRef.current = restored;
           setPendingMessages(restored);
         }
@@ -2003,8 +2058,7 @@ export function useChat(
     const content = pendingMessagesRef.current[index]?.trim();
     if (!session || !content || pendingQueueActionRef.current) return;
 
-    const selectionVersion = activeSessionSelectionRef.current;
-    const dispatch = () => dispatchPendingMessage(session.id, selectionVersion, index, content);
+    const dispatch = () => dispatchPendingMessage(session.id, index, content);
     if (isStreamingRef.current || streamRef.current) {
       cancelAndReconcile(dispatch);
       return;

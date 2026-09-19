@@ -70,7 +70,7 @@ import { readFile } from "node:fs/promises";
 import { schedulerLog } from "../logger.js";
 import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
 import { getPromptPath } from "./spec-staleness.js";
-import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
+import { isTaskPlanningOrExecutionLive } from "../agents/planning-execution-liveness.js";
 import { evaluateStrandedHoldContinuation } from "../plan-review-continuation.js";
 
 // FNXC:StrandedHoldContinuation 2026-07-26-14:15:
@@ -333,7 +333,13 @@ export async function evaluateCapacityHoldReadiness(
       try { promptContent = await readFile(getPromptPath(tasksDir, task.id), "utf8"); } catch { /* missing prompt is a quiet non-candidate */ }
       const settings = await store.getSettings();
       const continuations = await store.listWorkflowWorkItemsForTask(task.id);
-      const live = activeSessionRegistry.pathsForTask(task.id).some((path) => activeSessionRegistry.isPathActive(path)) || executingTaskLock.has(task.id) || deps.isTaskActive?.(task.id) === true;
+      /*
+      FNXC:PlanningExecutionLiveness 2026-09-06-00:29:
+      This shared liveness classification only suppresses a stranded-continuation warning; it does not
+      widen or release the execution gate. Including the planner here keeps diagnostics aligned with the
+      self-healing decisions without turning an in-flight plan into a release candidate.
+      */
+      const live = isTaskPlanningOrExecutionLive(task.id, { isTaskActive: deps.isTaskActive });
       const stranded = evaluateStrandedHoldContinuation({
         task,
         columnFlags: resolveColumnFlags(column),
@@ -455,13 +461,13 @@ yet, so grep `DELIBERATE-LITERAL` to enumerate the sites it must admit.
 */
 /** Legacy completion signal: dependency's column is a terminal/handoff column. */
 function legacyDependencySatisfied(dep: Task): boolean {
-  return dep.column === "done" || dep.column === "in-review" || dep.column === "archived";
+  return dep.column === "done" || dep.column === "in-review";
 }
 
 /**
  * KTD-5 dependency satisfaction: the dependency task's current column has the
  * `complete` trait flag in ITS resolved workflow. Dual-accept (FN-5719): the
- * legacy completion signal (done/in-review/archived column, or an accepted
+ * legacy completion signal (done/in-review column, or an accepted
  * completion-handoff marker) is also honored; when the two disagree an
  * audit-diff event is logged.
  */
