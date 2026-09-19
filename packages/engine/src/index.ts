@@ -13,6 +13,12 @@ export {
 export { ActiveSessionWorktreeRemovalError } from "./worktree/worktree-backend.js";
 export { planningLivenessRegistry, registerPlanningLivenessProbe, isPlanningLive } from "./agents/planning-liveness.js";
 export {
+  getTaskPlanningOrExecutionLivenessSignal,
+  isTaskPlanningOrExecutionLive,
+  type PlanningExecutionLivenessDeps,
+  type TaskLivenessSignal,
+} from "./agents/planning-execution-liveness.js";
+export {
   classifyReportHealth,
   type ReportHealthBucket,
   type ReportHealthClassification,
@@ -103,8 +109,6 @@ export {
   createWorkflowDeleteTool,
   createWorkflowSettingsTool,
   createTraitListTool,
-  createTaskArchiveTool,
-  createTaskUnarchiveTool,
   createTaskDeleteTool,
   createTaskRetryTool,
   createTaskPauseTool,
@@ -1274,7 +1278,6 @@ export {
   genericCliAdapter,
   type CliAdapterDescriptor,
 } from "./cli-agent/adapters/index.js";
-export { installBaselineArchiveWorktreeDisposer } from "./healing/archive-worktree-disposer-install.js";
 export { MemoryConsolidationService, resolveMemoryConsolidationPorts } from "./memory/index.js";
 
 // CLI Agent Executor — task ↔ session orchestration (U7).

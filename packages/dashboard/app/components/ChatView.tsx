@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import { FN_AGENT_ID, TASK_PLANNER_CHAT_AGENT_ID_PREFIX, useChat, type ChatMessageInfo, type ChatSessionInfo } from "../hooks/useChat";
 import { useChatUnread } from "../hooks/useChatUnread";
+import { useVirtualizedChatTranscript } from "../hooks/useVirtualizedChatTranscript";
 import { useComposerDictation } from "../hooks/useComposerDictation";
 import { useViewportMode } from "./Header";
 import { isTabletTouchViewport } from "../hooks/useViewportMode";
@@ -45,6 +46,7 @@ import { FileMentionPopup } from "./FileMentionPopup";
 import { CliChatSurface, type CliChatTier } from "./CliChatSurface";
 import { useFileMention } from "../hooks/useFileMention";
 import { useModelsCache } from "../hooks/useModelsCache";
+import { useFavorites } from "../hooks/useFavorites";
 import { useDiscoveredSkillsCache } from "../hooks/useDiscoveredSkillsCache";
 import { useChatSnippets } from "../hooks/useChatSnippetsCache";
 import { useAgentsMapCache } from "../hooks/useAgentsMapCache";
@@ -71,6 +73,7 @@ import { buildChatReportHandoff, type ChatReportHandoff } from "./chatReportHand
 import { matchChatCommand, filterChatCommands, getSlashTriggerMatch, selectChatCommands, type ChatCommand } from "./chat-commands";
 import { applySnippetToDraft, filterChatSnippets, matchStandaloneSnippetInvocation } from "./chat-snippets";
 import { useChatMessageLayout } from "../context/ChatMessageLayoutContext";
+import { useChatEnterSubmits } from "../context/ChatSubmitOnEnterContext";
 import {
   createChatInputAutosizeController,
   type ChatInputAutosizeController,
@@ -149,6 +152,7 @@ export interface ChatViewProps {
 
 const CHAT_CONTEXT_MENU_FALLBACK_WIDTH_PX = 200;
 const CHAT_CONTEXT_MENU_VIEWPORT_MARGIN_PX = 8;
+const CHAT_BOTTOM_FOLLOW_THRESHOLD_PX = 50;
 
 /** Returns an issue or pull-request URL as a standalone composer line. */
 export function buildIssueChatPrefill(url: string): string {
@@ -373,6 +377,7 @@ type CopyFeedbackState = "success" | "error" | null;
 export function ChatView({ projectId, addToast, floating = false, compactLayout = false, findActive = true, active = true, onPopOut, onMaximize, onClose, onOpenSessionInNewWindow, initialDirectSession, initialDirectSessionNonce, persistChatPreferences = true, chatCommandContext, initialComposerDraft, initialComposerDraftNonce, onSendAsReport }: ChatViewProps) {
   const { t } = useTranslation("app");
   const chatMessageLayout = useChatMessageLayout();
+  const enterSubmits = useChatEnterSubmits();
   useEffect(() => {
     recordResumeEvent({
       view: "ChatView",
@@ -621,7 +626,24 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
   const [conversationSearchIndex, setConversationSearchIndex] = useState(0);
   const { agentsMap: cachedAgentsMap } = useAgentsMapCache(projectId);
   const agentsMap = useMemo(() => (chatAgentsMap.size > 0 ? chatAgentsMap : cachedAgentsMap), [cachedAgentsMap, chatAgentsMap]);
-  const { models, favoriteProviders, favoriteModels, defaultProvider, defaultModelId } = useModelsCache();
+  const { defaultProvider, defaultModelId } = useModelsCache();
+  const {
+    availableModels: models,
+    favoriteProviders,
+    favoriteModels,
+    toggleFavoriteProvider,
+    toggleFavoriteModel,
+  } = useFavorites();
+  const handleToggleFavoriteProvider = useCallback((provider: string) => {
+    void toggleFavoriteProvider(provider).catch(() => {
+      addToast(t("models.errors.failedUpdateFavorites", "Failed to update favorites"), "error");
+    });
+  }, [addToast, t, toggleFavoriteProvider]);
+  const handleToggleFavoriteModel = useCallback((modelId: string) => {
+    void toggleFavoriteModel(modelId).catch(() => {
+      addToast(t("models.errors.failedUpdateModelFavorites", "Failed to update model favorites"), "error");
+    });
+  }, [addToast, t, toggleFavoriteModel]);
   const defaultModel = useMemo<DefaultModelSelection>(() => ({ provider: defaultProvider, modelId: defaultModelId }), [defaultModelId, defaultProvider]);
   const _dialogDefaultModel = useMemo<DefaultModelSelection>(() => {
     if (chatDefaultTarget?.kind === "model") {
@@ -694,8 +716,18 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
     wasPinnedBefore: boolean;
     capturedAtMs: number;
   } | null>(null);
+  const previousVirtualizedMessagesRef = useRef<{ threadId: string | null; ids: readonly string[] }>({ threadId: null, ids: [] });
   const hideSkillMenuTimeoutRef = useRef<number | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const transcriptKeys = useMemo(
+    () => [...messages.map((message) => message.id), ...(isStreaming ? ["__streaming__"] : [])],
+    [isStreaming, messages],
+  );
+  const virtualTranscript = useVirtualizedChatTranscript({
+    transcriptKey: activeSession?.id ?? null,
+    keys: transcriptKeys,
+    scrollRef: messagesContainerRef,
+  });
   const chatThreadRef = useRef<HTMLDivElement | null>(null);
   const clippedMessageFrameRef = useRef<number | null>(null);
   const [topClippedMessageIds, setTopClippedMessageIds] = useState<Set<string>>(() => new Set());
@@ -968,10 +1000,18 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
     });
   }, [updateTopClippedMessages]);
 
-  const captureScrollSnapshot = useCallback(() => {
+  const captureScrollSnapshot = useCallback((synchronizeOwnershipFromGeometry = false) => {
     const messagesContainer = messagesContainerRef.current;
     const threadId = getActiveThreadId();
     if (!messagesContainer || !threadId) return;
+
+    let isDetached = isUserScrollingRef.current;
+    if (synchronizeOwnershipFromGeometry) {
+      const atBottom = messagesContainer.scrollTop + messagesContainer.clientHeight >= messagesContainer.scrollHeight - CHAT_BOTTOM_FOLLOW_THRESHOLD_PX;
+      isDetached = !atBottom;
+      isUserScrollingRef.current = isDetached;
+      setIsUserScrolling(isDetached);
+    }
 
     const scrollTop = messagesContainer.scrollTop;
     const messageElements = messagesContainer.querySelectorAll<HTMLElement>(".chat-message[data-message-id]");
@@ -988,7 +1028,7 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
       clientHeight: messagesContainer.clientHeight,
       anchorMessageId,
       anchorOffset,
-      wasPinnedBefore: !isUserScrollingRef.current,
+      wasPinnedBefore: !isDetached,
       capturedAtMs: typeof performance !== "undefined" ? performance.now() : Date.now(),
     };
   }, [getActiveThreadId]);
@@ -997,11 +1037,7 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
     const messagesContainer = messagesContainerRef.current;
     if (!messagesContainer) return;
 
-    const threshold = 50;
-    const atBottom = messagesContainer.scrollTop + messagesContainer.clientHeight >= messagesContainer.scrollHeight - threshold;
-    setIsUserScrolling(!atBottom);
-    isUserScrollingRef.current = !atBottom;
-    captureScrollSnapshot();
+    captureScrollSnapshot(true);
     scheduleTopClippedMessageUpdate();
   }, [captureScrollSnapshot, scheduleTopClippedMessageUpdate]);
 
@@ -1018,7 +1054,8 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
 
     const writeBottom = () => {
       if (!container.isConnected) return;
-      if (!options?.force && isUserScrollingRef.current) {
+      // A forced thread-opening write may run once, but every settle frame must yield to a later manual scroll.
+      if (isUserScrollingRef.current && (!options?.force || frame > 0)) {
         return;
       }
 
@@ -1069,19 +1106,21 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
     };
   }, [activeThreadMessages, scheduleTopClippedMessageUpdate]);
 
-  useLayoutEffect(() => {
+  /*
+  FNXC:ChatScrollAnchor 2026-09-06-07:42:
+  L’envoi capture la propriété du viewport avant l’ajout optimiste : un lecteur au seuil bas suit chaque croissance de la réponse, tandis qu’un lecteur détaché conserve son message-ancre, y compris à scrollTop === 0. Tout défilement manuel met à jour la propriété synchroniquement et neutralise les frames et observateurs déjà programmés ; seul un retour volontaire au seuil bas ou « Latest » réactive le suivi.
+
+  FNXC:ChatScrollAnchor 2026-09-06-07:56:
+  Les changements de réflexion, de texte et d’outils sont chacun des croissances autonomes du fil. Chacun doit donc relancer le suivi conditionnel du bas, même lorsqu’aucune autre forme de delta n’accompagne une mise à jour d’outil.
+  */
+  const restoreDetachedScrollSnapshot = useCallback(() => {
     const messagesContainer = messagesContainerRef.current;
     const threadId = getActiveThreadId();
     const snapshot = scrollRestoreSnapshotRef.current;
     if (!messagesContainer || !threadId || !snapshot || snapshot.threadId !== threadId || snapshot.wasPinnedBefore) {
       return;
     }
-
-    const snapshotAgeMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - snapshot.capturedAtMs;
-    const hasScrollableOverflow = messagesContainer.scrollHeight > messagesContainer.clientHeight;
-    const isStaleSnapshot = snapshotAgeMs > 3000;
-    const isLikelyInvalidTopSample = snapshot.scrollTop <= 0 && snapshot.anchorOffset <= 0 && hasScrollableOverflow;
-    if (!isUserScrollingRef.current || isStaleSnapshot || isLikelyInvalidTopSample) {
+    if (!isUserScrollingRef.current) {
       scrollRestoreSnapshotRef.current = null;
       return;
     }
@@ -1091,18 +1130,54 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
       const anchorElement = getMessageElement(messagesContainer, snapshot.anchorMessageId);
       if (anchorElement) {
         restoredScrollTop = anchorElement.offsetTop - snapshot.anchorOffset;
-      } else {
-        restoredScrollTop = snapshot.scrollTop + (messagesContainer.scrollHeight - snapshot.scrollHeight);
       }
-    } else {
-      restoredScrollTop = snapshot.scrollTop + (messagesContainer.scrollHeight - snapshot.scrollHeight);
     }
 
     messagesContainer.scrollTop = Math.max(0, restoredScrollTop);
+    scrollRestoreSnapshotRef.current = {
+      ...snapshot,
+      scrollTop: messagesContainer.scrollTop,
+      scrollHeight: messagesContainer.scrollHeight,
+      clientHeight: messagesContainer.clientHeight,
+      capturedAtMs: typeof performance !== "undefined" ? performance.now() : Date.now(),
+    };
     isUserScrollingRef.current = true;
     setIsUserScrolling(true);
-    scrollRestoreSnapshotRef.current = null;
-  }, [activeThreadMessages, getActiveThreadId, getMessageElement]);
+  }, [getActiveThreadId, getMessageElement]);
+
+  /*
+  FNXC:ChatTranscriptVirtualization 2026-09-06-14:15:
+  Lorsqu’une page est préfixée, le virtualiseur est l’unique propriétaire de l’ancre et ajoute la hauteur estimée au scroll avant cet effet. La restauration DOM historique ne doit pas annuler ce déplacement lorsque l’ancienne ligne-ancre est hors fenêtre ; son snapshot est rebasé sur la géométrie déjà ajustée pour que les ResizeObserver ultérieurs conservent la lecture détachée.
+  */
+  useLayoutEffect(() => {
+    const threadId = getActiveThreadId();
+    const currentIds = activeThreadMessages.map((message) => message.id);
+    const previous = previousVirtualizedMessagesRef.current;
+    const prefixCount = currentIds.length - previous.ids.length;
+    const isVirtualizedPrepend = previous.threadId === threadId
+      && prefixCount > 0
+      && previous.ids.every((id, index) => currentIds[index + prefixCount] === id);
+    previousVirtualizedMessagesRef.current = { threadId, ids: currentIds };
+
+    if (isVirtualizedPrepend) {
+      const messagesContainer = messagesContainerRef.current;
+      const snapshot = scrollRestoreSnapshotRef.current;
+      if (messagesContainer && snapshot?.threadId === threadId && !snapshot.wasPinnedBefore) {
+        scrollRestoreSnapshotRef.current = {
+          ...snapshot,
+          scrollTop: messagesContainer.scrollTop,
+          scrollHeight: messagesContainer.scrollHeight,
+          clientHeight: messagesContainer.clientHeight,
+          anchorMessageId: null,
+          anchorOffset: 0,
+          capturedAtMs: typeof performance !== "undefined" ? performance.now() : Date.now(),
+        };
+      }
+      return;
+    }
+
+    restoreDetachedScrollSnapshot();
+  }, [activeThreadMessages, getActiveThreadId, restoreDetachedScrollSnapshot]);
 
   const logScrollDebug = useCallback((cause: string) => {
     if (typeof window === "undefined") {
@@ -1112,9 +1187,8 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
       return;
     }
     const container = messagesContainerRef.current;
-    const threshold = 50;
     const atBottom = container
-      ? container.scrollTop + container.clientHeight >= container.scrollHeight - threshold
+      ? container.scrollTop + container.clientHeight >= container.scrollHeight - CHAT_BOTTOM_FOLLOW_THRESHOLD_PX
       : true;
     console.debug("[chat-scroll]", {
       cause,
@@ -1216,7 +1290,7 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
       return;
     }
     scrollToBottom("streaming");
-  }, [isStreaming, streamingText, streamingThinking, scrollToBottom]);
+  }, [isStreaming, streamingText, streamingThinking, streamingToolCalls, scrollToBottom]);
 
   // Snap to latest on new messages only when the user was pinned before growth.
   useEffect(() => {
@@ -1461,6 +1535,7 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
 
     const observer = new ResizeObserver(() => {
       if (isUserScrollingRef.current) {
+        restoreDetachedScrollSnapshot();
         return;
       }
       anchorToBottom(messagesContainer);
@@ -1471,7 +1546,7 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
     return () => {
       observer.disconnect();
     };
-  }, [anchorToBottom, activeSession?.id]);
+  }, [anchorToBottom, activeSession?.id, restoreDetachedScrollSnapshot]);
 
   // Fetch agents on mount for name resolution (project-scoped with stale-request protection)
   useEffect(() => {
@@ -1825,16 +1900,17 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
       return;
     }
 
-    if (isStreaming && files.length > 0) {
+    if ((isStreaming || pendingQueueAction) && files.length > 0) {
       /*
-      FNXC:ChatAttachments 2026-08-10-05:53:
-      Queued direct turns carry text only, so refuse staged attachments during a live reply rather than orphaning previews for files the queue cannot send.
+      FNXC:ChatAttachments 2026-09-06-00:48:
+      Queued direct turns carry text only, so refuse staged attachments while a live reply or its durable cancellation barrier owns dispatch rather than orphaning previews for files the queue cannot send. cancelAndReconcile clears isStreaming synchronously, so pendingQueueAction closes that otherwise invisible window here, where button and Enter submissions converge.
       */
       addToast(t("chat.attachmentsNotQueued", "Attachments can't be queued while a reply is streaming — wait for it to finish"), "warning");
       return;
     }
 
     const sentFiles = new Set(files);
+    captureScrollSnapshot(true);
     snippetDraftEphemeralRef.current = false;
     setMessageInput("");
     try {
@@ -1862,10 +1938,12 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
     sendMessage,
     chatCommandContext,
     isStreaming,
+    pendingQueueAction,
     releaseSentAttachments,
     selectedChatCommands,
     chatSnippets,
     insertSnippetDraft,
+    captureScrollSnapshot,
     t,
   ]);
 
@@ -2108,7 +2186,17 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
         return;
       }
 
+      /*
+      FNXC:ChatComposer 2026-09-06-01:54:
+      `Shift+Enter` n'envoie jamais, y compris combiné à `Cmd/Ctrl` : `Cmd/Ctrl+Shift+Enter` n'est pas un envoi. Elle insère un saut de ligne, sauf dans le Chat lorsqu'un menu d'autocomplétion est ouvert — les trois menus du Chat (fichiers/tâches, agents, compétences) la consomment alors sans insérer de saut de ligne. Dans le Chat de tâche et le Chat du planificateur, `Shift+Enter` traverse le menu et insère bien un saut de ligne.
+      `Cmd/Ctrl+Enter` sans `Shift` envoie, indépendamment du réglage `chatSubmitOnEnter` et du type de pointeur.
+      `Entrée` sans `Cmd/Ctrl` ni `Shift` est gouvernée par `chatSubmitOnEnter` ; `Alt` n'est pas un modificateur d'envoi et ne change rien à cette règle.
+      Les règles 2 et 3 s'appliquent lorsqu'aucun menu d'autocomplétion n'est ouvert. Un menu ouvert a la priorité et consomme `Entrée` comme `Cmd/Ctrl+Enter` ; `Échap` ferme le menu et rétablit les règles.
+      Dans le Chat de tâche uniquement, une composition IME en cours (saisie CJK) court-circuite tout, `Cmd/Ctrl+Enter` compris, jusqu'à la validation du candidat.
+      Le bouton d'envoi reste rendu et actif dès que le brouillon n'est pas vide — menu ouvert et composition IME compris. Sur brouillon vide il est désactivé, comme aujourd'hui.
+      */
       if (e.key === "Enter" && !e.shiftKey) {
+        if (!(e.metaKey || e.ctrlKey) && !enterSubmits) return;
         e.preventDefault();
         void handleSendDispatch();
       }
@@ -2125,6 +2213,7 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
       handleSnippetSelect,
       handleCommandSelect,
       handleSendDispatch,
+      enterSubmits,
       fileMention,
       insertHashMention,
       messageInput,
@@ -2600,9 +2689,8 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
 
   useEffect(() => {
     if (!activeConversationMatchId) return;
-    const message = messagesContainerRef.current?.querySelector<HTMLElement>(`[data-message-id="${activeConversationMatchId}"]`);
-    message?.scrollIntoView({ block: "nearest" });
-  }, [activeConversationMatchId]);
+    virtualTranscript.scrollToKey(activeConversationMatchId, "center");
+  }, [activeConversationMatchId, virtualTranscript.scrollToKey]);
 
   useEffect(() => {
     const root = chatViewRef.current;
@@ -2804,16 +2892,8 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
   }, [addToast, copyFeedbackByMessageId, handleCopyResponse, onSendAsReport, showProviderResponseCopy, t]);
 
   const handleScrollMessageToTop = useCallback((messageId: string) => {
-    const containerEl = messagesContainerRef.current;
-    if (!containerEl) return;
-    const selector = `[data-testid="chat-message-${messageId}"]`;
-    const targetEl = containerEl.querySelector<HTMLElement>(selector);
-    if (!targetEl) return;
-
-    const top = targetEl.getBoundingClientRect().top - containerEl.getBoundingClientRect().top + containerEl.scrollTop;
-    const prefersReducedMotion = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    containerEl.scrollTo({ top, behavior: prefersReducedMotion ? "auto" : "smooth" });
-  }, []);
+    virtualTranscript.scrollToKey(messageId, "start");
+  }, [virtualTranscript.scrollToKey]);
 
   /*
    * FNXC:ChatMessageEdit 2026-08-24-03:34:
@@ -2826,93 +2906,74 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
   // provider path and the CLI-backed path (CliChatSurface thunks) render the
   // exact same JSX — no parallel message/composer UI.
   const renderSessionMessagesPane = () => (
-    <div className="chat-messages" ref={messagesContainerRef} onScroll={updateScrollState}>
+    <div className="chat-messages" ref={messagesContainerRef} onScroll={() => { virtualTranscript.onScroll(); updateScrollState(); }}>
       <div ref={loadMoreSentinelRef} className="chat-load-more-sentinel">
         {hasMoreMessages && messagesLoading && (
           <div className="chat-loading-older">{t("chat.loadingOlderMessages", "Loading older messages…")}</div>
         )}
       </div>
-      {isStreaming ? (
-        <>
-          {messages.map((message, index) => (
-            <StandardChatMessageItem
-              key={message.id}
-              message={message}
-              forcePlain={false}
-              agentName={resolveMessageAssistantIdentity(message).agentName}
-              hideAssistantIdentity={resolveMessageAssistantIdentity(message).hideAssistantIdentity}
-              showAssistantModelTag={showAssistantModelTag}
-              activeModelTag={activeModelTag}
-              activeModelProvider={activeModelProvider}
-              activeSessionId={activeSession?.id ?? null}
-              projectId={projectId}
-              mentionAgentsByName={mentionAgentsByName}
-              roomContext={null}
-              copyAction={renderMessageActions(message.id, message.content, message.role)}
-              onQuoteMessage={handleQuoteMessage}
-              onScrollToTop={handleScrollMessageToTop}
-              isTopClipped={topClippedMessageIds.has(message.id)}
-              isAwaitingQuestionAnswer={message.role === "assistant" && index === messages.length - 1 && !isStreaming}
-              submittedQuestionAnswer={findSubmittedQuestionAnswer(messages, index)}
-              onQuestionSubmit={handleQuestionSubmit}
-              canEdit={canEditChatMessages}
-              onEditMessage={editMessageAndResend}
-              isSearchMatch={conversationSearchMatches.includes(message.id)}
-              isSearchActive={activeConversationMatchId === message.id}
-            />
-          ))}
-          <StandardStreamingMessage
-            streamingText={streamingText}
-            streamingThinking={streamingThinking}
-            streamingToolCalls={streamingToolCalls}
-            forcePlain={false}
-            agentName={agentName}
-            hideAssistantIdentity={hideAssistantIdentity}
-            showAssistantModelTag={showAssistantModelTag}
-            activeModelTag={activeModelTag}
-            activeModelProvider={activeModelProvider}
-            /* FNXC:StructuralMail 2026-08-09-09:09: A streaming answer is unfinished and must never be routed as a report. */
-            copyAction={showProviderResponseCopy && streamingText ? renderMessageActions("__streaming__", streamingText, "assistant", "chat-copy-response-streaming", false) : undefined}
-            onQuestionSubmit={handleQuestionSubmit}
-            isSearchMatch={conversationSearchMatches.includes("__streaming__")}
-            isSearchActive={activeConversationMatchId === "__streaming__"}
-          />
-        </>
-      ) : messagesLoading && messages.length === 0 ? (
+      {messagesLoading && messages.length === 0 && !isStreaming ? (
         <div className="chat-empty-state">{t("chat.loadingMessages", "Loading messages...")}</div>
-      ) : messages.length === 0 && !activeSession ? (
+      ) : messages.length === 0 && !isStreaming && !activeSession ? (
         renderEmptyState()
-      ) : messages.length === 0 && activeSession ? (
+      ) : messages.length === 0 && !isStreaming && activeSession ? (
         <div className="chat-empty-state">{t("chat.noMessagesYet", "No messages yet. Start the conversation!")}</div>
       ) : (
         <>
-          {messages.map((message, index) => (
-            <StandardChatMessageItem
-              key={message.id}
-              message={message}
-              forcePlain={false}
-              agentName={resolveMessageAssistantIdentity(message).agentName}
-              hideAssistantIdentity={resolveMessageAssistantIdentity(message).hideAssistantIdentity}
-              showAssistantModelTag={showAssistantModelTag}
-              activeModelTag={activeModelTag}
-              activeModelProvider={activeModelProvider}
-              activeSessionId={activeSession?.id ?? null}
-              projectId={projectId}
-              mentionAgentsByName={mentionAgentsByName}
-              roomContext={null}
-              copyAction={renderMessageActions(message.id, message.content, message.role)}
-              onQuoteMessage={handleQuoteMessage}
-              onScrollToTop={handleScrollMessageToTop}
-              isTopClipped={topClippedMessageIds.has(message.id)}
-              isAwaitingQuestionAnswer={message.role === "assistant" && index === messages.length - 1 && !isStreaming}
-              submittedQuestionAnswer={findSubmittedQuestionAnswer(messages, index)}
-              onQuestionSubmit={handleQuestionSubmit}
-              canEdit={canEditChatMessages}
-              onEditMessage={editMessageAndResend}
-              isSearchMatch={conversationSearchMatches.includes(message.id)}
-              isSearchActive={activeConversationMatchId === message.id}
-            />
-          ))}
+          {virtualTranscript.topSpacerHeight > 0 && <div className="chat-transcript-spacer" style={{ height: virtualTranscript.topSpacerHeight }} aria-hidden="true" />}
+          {virtualTranscript.visibleKeys.map((key) => {
+            if (key === "__streaming__") {
+              return <div key={key} ref={virtualTranscript.measureRow(key)} className="chat-transcript-row">
+                <StandardStreamingMessage
+                  streamingText={streamingText}
+                  streamingThinking={streamingThinking}
+                  streamingToolCalls={streamingToolCalls}
+                  forcePlain={false}
+                  agentName={agentName}
+                  hideAssistantIdentity={hideAssistantIdentity}
+                  showAssistantModelTag={showAssistantModelTag}
+                  activeModelTag={activeModelTag}
+                  activeModelProvider={activeModelProvider}
+                  /* FNXC:StructuralMail 2026-08-09-09:09: A streaming answer is unfinished and must never be routed as a report. */
+                  copyAction={showProviderResponseCopy && streamingText ? renderMessageActions("__streaming__", streamingText, "assistant", "chat-copy-response-streaming", false) : undefined}
+                  onQuestionSubmit={handleQuestionSubmit}
+                  isSearchMatch={conversationSearchMatches.includes("__streaming__")}
+                  isSearchActive={activeConversationMatchId === "__streaming__"}
+                />
+              </div>;
+            }
+            const index = messages.findIndex((message) => message.id === key);
+            const message = messages[index];
+            if (!message) return null;
+            const identity = resolveMessageAssistantIdentity(message);
+            return <div key={key} ref={virtualTranscript.measureRow(key)} className="chat-transcript-row">
+              <StandardChatMessageItem
+                message={message}
+                forcePlain={false}
+                agentName={identity.agentName}
+                hideAssistantIdentity={identity.hideAssistantIdentity}
+                showAssistantModelTag={showAssistantModelTag}
+                activeModelTag={activeModelTag}
+                activeModelProvider={activeModelProvider}
+                activeSessionId={activeSession?.id ?? null}
+                projectId={projectId}
+                mentionAgentsByName={mentionAgentsByName}
+                roomContext={null}
+                copyAction={renderMessageActions(message.id, message.content, message.role)}
+                onQuoteMessage={handleQuoteMessage}
+                onScrollToTop={handleScrollMessageToTop}
+                isTopClipped={topClippedMessageIds.has(message.id)}
+                isAwaitingQuestionAnswer={message.role === "assistant" && index === messages.length - 1 && !isStreaming}
+                submittedQuestionAnswer={findSubmittedQuestionAnswer(messages, index)}
+                onQuestionSubmit={handleQuestionSubmit}
+                canEdit={canEditChatMessages}
+                onEditMessage={editMessageAndResend}
+                isSearchMatch={conversationSearchMatches.includes(message.id)}
+                isSearchActive={activeConversationMatchId === message.id}
+              />
+            </div>;
+          })}
+          {virtualTranscript.bottomSpacerHeight > 0 && <div className="chat-transcript-spacer" style={{ height: virtualTranscript.bottomSpacerHeight }} aria-hidden="true" />}
         </>
       )}
       <div ref={messagesEndRef} />
@@ -3070,7 +3131,9 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
             defaultThinkingLevel={resolvedDefaultThinkingLevel}
             models={models}
             favoriteProviders={favoriteProviders}
+            onToggleFavorite={handleToggleFavoriteProvider}
             favoriteModels={favoriteModels}
+            onToggleModelFavorite={handleToggleFavoriteModel}
             agents={Array.from(agentsMap.values())}
             agentId={activeSession?.agentId}
             modelProvider={activeSession?.modelProvider}
@@ -3109,6 +3172,7 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
             value={messageInput}
             onChange={handleInputChange}
             onKeyDown={handleInputKeyDown}
+            enterKeyHint={enterSubmits ? "send" : "enter"}
             onKeyUp={handleInputKeyUp}
             onClick={handleInputSelectionChange}
             onBlur={handleInputBlur}
@@ -3124,7 +3188,6 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
               // the visualViewport/input-focus effects own scroll compensation.
             }}
             rows={1}
-            disabled={pendingQueueAction}
             data-testid="chat-input"
           />
           <AgentMentionPopup
@@ -3157,14 +3220,14 @@ export function ChatView({ projectId, addToast, floating = false, compactLayout 
             loading={fileMention.loading}
           />
         </div>
-        <MicButton {...composerDictation.micProps} disabled={pendingQueueAction} />
+        <MicButton {...composerDictation.micProps} />
         {/*
-        FNXC:ChatPendingQueue 2026-08-19-06:25:
-        Force-send cancellation must own the Direct composer until server reconciliation completes; otherwise a new send is queued while the selected entry is being dispatched and loses its priority.
+        FNXC:ChatPendingQueue 2026-09-06-00:48:
+        Force-send cancellation owns dispatch, not local composition: the send threshold queues new text until reconciliation preserves the selected entry's priority. Keep canSend action-oriented because Enter bypasses it; attachment-bearing attempts converge in handleSend on the same explicit refusal.
         */}
         <StandardChatActionButton
           isStreaming={isStreaming}
-          canSend={!pendingQueueAction && Boolean(messageInput.trim() || pendingAttachments.length > 0)}
+          canSend={Boolean(messageInput.trim() || pendingAttachments.length > 0)}
           onSend={handleSend}
           onStop={stopStreaming}
         />
