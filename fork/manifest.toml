@@ -1,0 +1,62 @@
+schema_version = 1
+
+# What this file is: the machine-readable inventory of what Fusion-EH carries on top of an exact
+# upstream release, and the input to scripts/check-fork-contract.mjs. It records identity and file
+# attribution only. Why a patch exists, when it retires, what it collides with and how it was proven
+# are rows in the estate patch registry in blueprint.db (decision 928), never restated here.
+
+[upstream]
+repository = "https://github.com/Runfusion/Fusion"
+tag = "v0.78.0-beta.4"
+commit = "cd0d006be39ef47ea034358d339ad21369cd33bb"
+tracking_policy = "released-tags-only"
+
+[downstream]
+repository = "https://github.com/scubashack808/Fusion-EH"
+branch = "main"
+package = "@runfusion/fusion"
+package_manifest = "packages/cli/package.json"
+law_decision = 609
+registry = "blueprint.db patch_registry, repo scubashack808/Fusion-EH"
+artifact_identity = "the deployed image is tagged with the short commit of main and carries the full commit in org.opencontainers.image.revision; the package version stays upstream's"
+provenance = "reworked 2026-09-19 for the merge shape: main is the fork's line, protected, and every upstream release arrives as a pull request merging its tag"
+
+[[patches]]
+id = "approval-resume-loop"
+last_reviewed_upstream = "v0.78.0-beta.4"
+paths = [
+  ".changeset/local-approval-gate-resume.md",
+  "packages/core/src/types/agents/agent-state.ts",
+  "packages/dashboard/src/routes/register-approval-routes.ts",
+  "packages/engine/src/pi.ts",
+  "packages/engine/src/__tests__/agent-action-gate.test.ts",
+]
+
+[[patches]]
+id = "chained-git-classification"
+last_reviewed_upstream = "v0.78.0-beta.4"
+paths = [
+  ".changeset/local-chained-git-classification.md",
+  "packages/engine/src/execution/gating-classifications.ts",
+  "packages/engine/src/__tests__/gating-classifications.test.ts",
+]
+
+[[patches]]
+id = "shell-file-write-gating"
+last_reviewed_upstream = "v0.78.0-beta.4"
+paths = [
+  ".changeset/local-shell-file-write-gating.md",
+  "packages/engine/src/execution/gating-classifications.ts",
+  "packages/engine/src/agents/agent-action-gate.ts",
+  "packages/engine/src/agents/permanent-agent-gating.ts",
+  "packages/engine/src/__tests__/gating-classifications.test.ts",
+]
+
+[[patches]]
+id = "fork-contract"
+last_reviewed_upstream = "v0.78.0-beta.4"
+paths = [
+  "fork/**",
+  "fork-update.sh",
+  "scripts/check-fork-contract.mjs",
+]
